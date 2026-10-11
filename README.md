@@ -138,12 +138,12 @@ text.
 
 ```
 Usage: generate [-h | --help] [-t | --temperature <float>] \
-                <weights_file> <tokenizer_file> <num_tokens> <prompt>
+                [-kv] <weights_file> <tokenizer_file> <num_tokens> <prompt>
 ```
 
 ```bash
 cd build
-./generate -t 0.8 ../gpt2_124M.bin ../gpt2_tokenizer.bin 20 "Once upon a time"
+./generate -t -kv 0.8 ../gpt2_124M.bin ../gpt2_tokenizer.bin 20 "Once upon a time"
 ```
 
 Temperature defaults to 0.75; `-t 0` selects greedy decoding. Top-k is fixed at
@@ -160,6 +160,54 @@ distributions — the top ten candidates often span barely 1.5 logits — so alw
 taking the argmax funnels into loops. That flatness is the reason temperature
 and top-k exist, and it is why the layer-by-layer check below, not the prose
 quality, is what tells you the forward pass is right.
+
+## KV Cache
+
+A layer-wise KV Cache is implemented that remembers the layer-wise Keys and Values for the Prefill phase from the given input prompt.
+Every decode phase uses the previously built KV Cache and appends the newly Key, Value entries for the generated token into the KV Cache.
+
+Example usage:
+
+**Using KV Cache**
+
+./generate -kv -t 0.8 ../gpt2_124M.bin ../gpt2_tokenizer.bin 20 "Once upon a time"
+Weights file:          ../gpt2_124M.bin
+Tokenizer file:        ../gpt2_tokenizer.bin
+Tokens to generate:    20
+Temperature            0.8
+
+Loaded checkpoint file. Size: 474MB
+Context length:         1024
+Vocabulary size:        50257
+Layers:                 12
+Attention heads:        12
+Embedding dimensions:   768
+Padded vocabulary size: 50304
+ time when only the king's children were allowed to be in the house at all.
+
+Now
+Total Elapsed time: 4746ms milliseconds
+
+
+**Default Forward Pass**
+
+./generate -t 0.8 ../gpt2_124M.bin ../gpt2_tokenizer.bin 20 "Once upon a time"    
+Weights file:          ../gpt2_124M.bin
+Tokenizer file:        ../gpt2_tokenizer.bin
+Tokens to generate:    20
+Temperature            0.8
+
+Loaded checkpoint file. Size: 474MB
+Context length:         1024
+Vocabulary size:        50257
+Layers:                 12
+Attention heads:        12
+Embedding dimensions:   768
+Padded vocabulary size: 50304
+ time when only the king's children were allowed to be in the house at all.
+
+Now
+Total Elapsed time: 41891ms milliseconds
 
 ## Running the validation
 
@@ -188,7 +236,7 @@ the reference.
 - [x] Autoregressive generation loop with a sliding context window
 - [x] Sampling: greedy, temperature, top-k
 - [ ] BPE encoder, so prompts can be given as text
-- [ ] KV cache
+- [x] KV cache
 - [ ] Batched inference
 
 ## License
