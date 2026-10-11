@@ -170,6 +170,7 @@ Example usage:
 
 **Using KV Cache**
 
+```
 ./generate -kv -t 0.8 ../gpt2_124M.bin ../gpt2_tokenizer.bin 20 "Once upon a time"
 Weights file:          ../gpt2_124M.bin
 Tokenizer file:        ../gpt2_tokenizer.bin
@@ -187,10 +188,11 @@ Padded vocabulary size: 50304
 
 Now
 Total Elapsed time: 4746ms milliseconds
-
+```
 
 **Default Forward Pass**
 
+```
 ./generate -t 0.8 ../gpt2_124M.bin ../gpt2_tokenizer.bin 20 "Once upon a time"    
 Weights file:          ../gpt2_124M.bin
 Tokenizer file:        ../gpt2_tokenizer.bin
@@ -208,6 +210,7 @@ Padded vocabulary size: 50304
 
 Now
 Total Elapsed time: 41891ms milliseconds
+```
 
 ## Running the validation
 
