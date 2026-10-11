@@ -164,7 +164,7 @@ quality, is what tells you the forward pass is right.
 ## KV Cache
 
 A layer-wise KV Cache is implemented that remembers the layer-wise Keys and Values for the Prefill phase from the given input prompt.
-Every decode phase uses the previously built KV Cache and appends the newly Key, Value entries for the generated token into the KV Cache.
+Every decode phase uses the previously built KV Cache and appends the newly generated Key, Value entries for the generated token into the KV Cache.
 
 Example usage:
 
