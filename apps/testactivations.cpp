@@ -188,7 +188,7 @@ int main(int argc, char** argv) {
     cout << "Padded vocabulary size: " << ckpt.vocab_padded << "\n";
     cout << "----------------------------------------\n";
     // instantiate the decoder from the checkpoint
-    Decoder gpt2(ckpt);
+    Decoder gpt2(ckpt, false /* use_kv_cache */);
 
     // read tokens from file to pass into the decoder
     MappedFile tf(get<string>(args["sample_tokens_file"]).c_str());

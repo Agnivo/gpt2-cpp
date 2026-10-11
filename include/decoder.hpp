@@ -12,9 +12,12 @@
 
 #include "checkpoint.hpp"
 #include "tensor.hpp"
+#include "kvcache.hpp"
 
 using tn::MatrixView;
 using tn::Tensor;
+using kvcache::LayerKVCache;
+using kvcache::KVCache;
 
 namespace decoder {
 
@@ -44,13 +47,17 @@ class LayerNorm {
 
 class MHSA {
    public:
-    MHSA(std::span<const float> qkvw, std::span<const float> qkvb, std::span<const float> attprojw,
-         std::span<const float> attprojb, int nheads)
-        : qkvw_(qkvw), qkvb_(qkvb), attprojw_(attprojw), attprojb_(attprojb), nheads_(nheads) {}
-    MHSA() = default;
+    MHSA(bool use_kv_cache, LayerKVCache& layer_kv_cache, std::span<const float> qkvw, std::span<const float> qkvb, 
+         std::span<const float> attprojw, std::span<const float> attprojb, int nheads)
+        : use_kv_cache_(use_kv_cache), kv_cache_(layer_kv_cache), qkvw_(qkvw), qkvb_(qkvb), attprojw_(attprojw), 
+          attprojb_(attprojb), nheads_(nheads) {}
+    MHSA() = delete;
     Tensor forward(const Tensor& x) const;
+    Tensor decode(KVCache &kv_cache, int layer_index, const Tensor& x);
 
    private:
+    bool use_kv_cache_;
+    LayerKVCache &kv_cache_;
     std::span<const float> qkvw_;      // shape (3C, C) C is the embedding dimension
     std::span<const float> qkvb_;      // shape (3C)
     std::span<const float> attprojw_;  // shape (C, C)
@@ -72,20 +79,22 @@ class FFN {
 
 class Layer {
    public:
-    Layer() = default;
-    Layer(std::span<const float> ln1w, std::span<const float> ln1b, std::span<const float> qkvw,
+    Layer() = delete;
+    Layer(bool use_kv_cache, LayerKVCache& layer_kv_cache, std::span<const float> ln1w, std::span<const float> ln1b, std::span<const float> qkvw,
           std::span<const float> qkvb, std::span<const float> attprojw,
           std::span<const float> attprojb, std::span<const float> ln2w, std::span<const float> ln2b,
           std::span<const float> fcw, std::span<const float> fcb, std::span<const float> fcprojw,
           std::span<const float> fcprojb, float eps, int nheads, int embsz)
         : ln1_(LayerNorm(ln1w, ln1b, eps)),
-          attn_(MHSA(qkvw, qkvb, attprojw, attprojb, nheads)),
+          attn_(MHSA(use_kv_cache, layer_kv_cache, qkvw, qkvb, attprojw, attprojb, nheads)),
           ln2_(LayerNorm(ln2w, ln2b, eps)),
           ffn_(FFN(MatrixView(fcw.data(), 4 * embsz, embsz), fcb,
                    MatrixView(fcprojw.data(), embsz, 4 * embsz), fcprojb)) {}
     Tensor forward(const Tensor& x);
+    Tensor decode(KVCache &kv_cache, int layer_index, const Tensor& x);
 
    private:
+
     LayerNorm ln1_;
     MHSA attn_;
     LayerNorm ln2_;
@@ -94,10 +103,15 @@ class Layer {
 
 class Decoder {
    public:
-    Decoder(Checkpoint& ckpt);
+    Decoder(Checkpoint& ckpt, bool use_kv_cache);
     Tensor forward(std::vector<int32_t> tokens,
                    const std::function<void(const int index, const Tensor&)>& checkActivations);
     Tensor embed(std::span<const int32_t> tokens);
+    Tensor embed_one(const int32_t token, const int32_t position);
+    void prefill(std::vector<int32_t> tokens);
+    Tensor decode(int32_t token, int32_t position, 
+                  const std::function<void(const int index, const Tensor&)>& checkActivations);
+    void forget_all_tokens();
 
    private:
     int vocab_;                  // vocabulary size
@@ -112,6 +126,9 @@ class Decoder {
     int maxT_;                   // max context size
     MatrixView wte_;             // token embeding matrix
     MatrixView wpe_;             // positional encoding matrix
+    bool use_kv_cache_;          // should the decoder use key value cache?
+    KVCache kv_cache_;           // key-value cache
+
     void loadFromCheckpoint(Checkpoint checkpoint);
     void loadLayerWeights(int i, std::span<const float> ln1w, std::span<const float> ln1b,
                           std::span<const float> qkvw, std::span<const float> qkvb,

@@ -95,6 +95,19 @@ Tensor Tensor::add_bias(const Tensor& bias) const {  // this: (rows, cols), bias
     return output;
 }
 
+Tensor Tensor::slice(int row_start, int row_end, int col_start, int col_end)
+{
+    Tensor output = Tensor(row_end - row_start, col_end - col_start);
+    for (int i = row_start; i < row_end; i++)
+    {
+        for (int j = col_start; j < col_end; j++)
+        {
+            output.set(i - row_start, j - col_start, at(i, j));
+        }
+    }
+    return output;
+}
+
 // input: Tensor(batchsize, logits)
 // output: Tensor(batchsize, probabilities)
 Tensor Tensor::softmax() const {
