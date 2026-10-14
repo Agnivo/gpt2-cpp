@@ -2,12 +2,14 @@
 
 #include <functional>
 
+#include "kvcache.hpp"
 #include "mappedfile.hpp"
 #include "tensor.hpp"
 
 using namespace decoder;
 using namespace tn;
 using namespace std;
+using namespace kvcache;
 
 // See https://docs.pytorch.org/docs/2.14/generated/torch.nn.GELU.html
 inline void gelu_(Tensor& x) {
@@ -23,16 +25,21 @@ inline void gelu_(Tensor& x) {
 
 // input shape (T, C), output shape (T, C)
 // See https://arxiv.org/pdf/2002.04745 Figure 1b.
-Tensor Layer::forward(const Tensor& x) {
-    Tensor out(x.rows(), x.cols());
-    Tensor h(x.rows(), x.cols());
-    Tensor h1(x.rows(), x.cols());
-    out = ln1_.forward(x);
-    out = attn_.forward(out);
-    h = out + x;  // add the residual stream
-    h1 = ln2_.forward(h);
+// kv_cache == nullptr runs full attention over all T rows. Otherwise x is the single new
+// token's row, and attention reads from and appends to the cache.
+Tensor Layer::run(const Tensor& x, KVCache* kv_cache, int layer_index) {
+    Tensor out = ln1_.forward(x);
+    out = kv_cache ? attn_.decode(*kv_cache, layer_index, out) : attn_.forward(out);
+    Tensor h = out + x;  // add the residual stream
+    Tensor h1 = ln2_.forward(h);
     h1 = ffn_.forward(h1);
     return h + h1;  // add the residual stream
+}
+
+Tensor Layer::forward(const Tensor& x) { return run(x, nullptr, 0); }
+
+Tensor Layer::decode(KVCache& kv_cache, int layer_index, const Tensor& x) {
+    return run(x, &kv_cache, layer_index);
 }
 
 // Linear (input, hidden), GELU, Linear (hidden, output)
@@ -120,6 +127,15 @@ Tensor MHSA::forward(const Tensor& x) const {
     Tensor qkv = lqkv.forward(x);  // Shape (T, 3C)
     assert(qkv.rows() == T && qkv.cols() == 3 * C);
 
+    if (use_kv_cache_) {
+        for (int i = 0; i < T; i++) {
+            Tensor k = qkv.slice(i, i + 1, C, 2 * C);
+            Tensor v = qkv.slice(i, i + 1, 2 * C, 3 * C);
+
+            kv_cache_.add(k, v);
+        }
+    }
+
     // next step is to separate the qkv Tensor shape (T, 3C)
     // into 3 Tensors q, k, v each shape = (T, C)
     // Also, we need to split each q, k, v further into shape (T, C/nheads) for each of the
@@ -164,7 +180,74 @@ Tensor MHSA::forward(const Tensor& x) const {
     return attnproj;
 }
 
-Decoder::Decoder(Checkpoint& ckpt) {
+Tensor MHSA::decode(KVCache& kv_cache, int layer_index, const Tensor& x) {
+    int C = x.cols();                                           // For gpt-2 this is 768
+    int num_tokens = kv_cache.get_num_tokens(layer_index) + 1;  // include the new token
+    Tensor out(1, C);                                           // Shape (1, C)
+
+    // Check tensor shapes for sanity
+    assert(qkvw_.size() == static_cast<size_t>(C * 3 * C));
+    assert(qkvb_.size() == static_cast<size_t>(3 * C));
+    assert(attprojw_.size() == static_cast<size_t>(C * C));
+    assert(attprojb_.size() == static_cast<size_t>(C));
+
+    // first step is the linear: h = x @ qkvw^T + qkvb
+    // qkvw is of shape (3C, C).
+    // shape: lqkv (1, 3C) <- x (1, C) @ qkvw (3C, C)^T + qkvb (3C)
+    MatrixView qkvw(&qkvw_[0], 3 * C, C);
+
+    // Now apply the linear
+    Linear lqkv(qkvw, qkvb_);
+    Tensor qkv = lqkv.forward(x);  // Shape (1, 3C)
+    assert(qkv.rows() == 1 && qkv.cols() == 3 * C);
+
+    Tensor keys, values;
+    Tensor keys_token = Tensor(1, C), values_token = Tensor(1, C);
+
+    kv_cache.get_keys(layer_index, keys);      // Shape (T, C)
+    kv_cache.get_values(layer_index, values);  // Shape (T, C)
+
+    for (int i = 0; i < C; i++) {
+        keys.set(num_tokens - 1, i, qkv.at(0, C + i));
+        values.set(num_tokens - 1, i, qkv.at(0, (2 * C) + i));
+        keys_token.set(0, i, qkv.at(0, C + i));
+        values_token.set(0, i, qkv.at(0, (2 * C) + i));
+    }
+
+    kv_cache.add(layer_index, keys_token, values_token);
+
+    assert(C % nheads_ == 0);
+    for (int i = 0; i < nheads_; i++) {
+        // Per head q. Shape (1, C/nheads)
+        MatrixView qh(qkv.raw() + (i * C) / nheads_, 1, C / nheads_, 3 * C, 1);
+        // Per head k, and v. Shape (T, C/nheads)
+        MatrixView kh(keys.raw() + (i * C) / nheads_, num_tokens, C / nheads_, C, 1);
+        MatrixView vh(values.raw() + (i * C) / nheads_, num_tokens, C / nheads_, C, 1);
+        // Shape (C/nheads, T)
+        MatrixView kht = kh.transpose();
+
+        // scaled dot product (1, C/nheads) @ (C/nheads, T) -> (1, T)
+        Tensor sdp = matmul(qh, kht).scale(1.0 / sqrt(C / nheads_));  // Shape (1, T)
+        assert(sdp.rows() == 1 && sdp.cols() == num_tokens);
+
+        // Softmax
+        Tensor softmax = sdp.softmax();  // Shape (1, T)
+
+        // Extract the value vector
+        Tensor val = softmax.matmul(vh);  // Shape (1, T) @ (T, C/nheads) -> (1, C/nheads)
+        assert(val.rows() == 1 && val.cols() == C / nheads_);
+        // Stack the matrix from each head to get (T, C)
+        memcpy(out.raw() + (i * C) / nheads_, val.raw(), C / nheads_ * sizeof(float));
+    }
+    // Apply the linear projection
+    // shapes: out(T, C) @ attproj(C, C) -> (T, C)
+    Linear lproj(MatrixView(&attprojw_[0], C, C), attprojb_);
+    Tensor attnproj = lproj.forward(out);
+    assert(attnproj.rows() == 1 && attnproj.cols() == C);
+    return attnproj;
+}
+
+Decoder::Decoder(Checkpoint& ckpt, bool use_kv_cache) {
     vocab_ = ckpt.vocab;                // vocabulary size
     nlayers_ = ckpt.layers;             // # of layers
     numheads_ = ckpt.nh;                // # of heads
@@ -172,8 +255,9 @@ Decoder::Decoder(Checkpoint& ckpt) {
     vocab_padded_ = ckpt.vocab_padded;  // padded vocabulary size
     eps_ = 1.0e-5;                      // to prevent division by 0 in layernorm
     maxT_ = ckpt.maxT;                  // max context size
+    use_kv_cache_ = use_kv_cache;
+    kv_cache_ = KVCache(nlayers_, embedsize_);
 
-    layers_.reserve(nlayers_);
     // Load weights into decoder
     for (int i = 0; i < nlayers_; i++) {
         loadLayerWeights(
@@ -229,8 +313,9 @@ void Decoder::loadLayerWeights(int i, span<const float> ln1w, span<const float> 
                                span<const float> ln2w, span<const float> ln2b,
                                span<const float> fcw, span<const float> fcb,
                                span<const float> fcprojw, span<const float> fcprojb) {
-    layers_[i] = Layer(ln1w, ln1b, qkvw, qkvb, attprojw, attprojb, ln2w, ln2b, fcw, fcb, fcprojw,
-                       fcprojb, eps_, numheads_, embedsize_);
+    LayerKVCache& layer_kv_cache = kv_cache_.get_layer_kv_cache(i);
+    layers_.emplace_back(use_kv_cache_, layer_kv_cache, ln1w, ln1b, qkvw, qkvb, attprojw, attprojb,
+                         ln2w, ln2b, fcw, fcb, fcprojw, fcprojb, eps_, numheads_, embedsize_);
 }
 
 void Decoder::loadLNWeights(span<const float> lnfw, span<const float> lnfb) {
@@ -257,13 +342,23 @@ Tensor Decoder::embed(span<const int32_t> tokens) {
     return x;
 }
 
-// The input into the decoder is of shape (T, C), and output are logits of shape (1, V)
-// the predicted token
-Tensor Decoder::forward(
-    vector<int32_t> tokens,
-    const std::function<void(const int index, const Tensor&)>& checkActivations) {
+// Looks up tokens in an embedding matrix -> (1, C)
+// Adds positional embeddings -> (1, C)
+// Returns a tensor of shape (1, C)
+Tensor Decoder::embed_one(const int32_t token, const int32_t position) {
+    Tensor x(1, wte_.cols);
+    assert(token >= 0 && token < wte_.rows);
+    for (int j = 0; j < wte_.cols; j++) {
+        x.set(0, j, wte_.at(token, j) + wpe_.at(position, j));
+    }
+    return x;
+}
+
+// x is the embedded input: shape (T, C) when cached is false,
+// and (1, C) holding just the new token when cached is true. Output are logits of shape (1, V).
+Tensor Decoder::run(Tensor x, bool cached,
+                    const std::function<void(const int index, const Tensor&)>& checkActivations) {
     int tensorindex = 0;
-    Tensor x = embed(tokens);        // embedding + postitional encoding
     assert(x.cols() == embedsize_);  // shape of x (T, C)
     assert(x.rows() <= maxT_);       // make sure # of tokens <= max context window
     if (checkActivations) {
@@ -272,7 +367,7 @@ Tensor Decoder::forward(
 
     // Run through all the layers
     for (int i = 0; i < nlayers_; i++) {
-        x = layers_[i].forward(x);
+        x = cached ? layers_[i].decode(kv_cache_, i, x) : layers_[i].forward(x);
         if (checkActivations) {
             checkActivations(tensorindex++, x);
         }
@@ -305,4 +400,57 @@ Tensor Decoder::forward(
     }
     assert(final_logits.rows() == 1 && final_logits.cols() == vocab_);
     return final_logits;
+}
+
+// The input into the decoder is of shape (T, C), and output are logits of shape (1, V)
+Tensor Decoder::forward(
+    vector<int32_t> tokens,
+    const std::function<void(const int index, const Tensor&)>& checkActivations) {
+    return run(embed(tokens), false, checkActivations);  // embedding + postitional encoding
+}
+
+/* Generate the KV cache for all the input prompt tokens by running through a forward pass
+ * of the Decoder.
+ *
+ * As an example, if the input is "Once upon a time",
+ * the prefill step will generate the Keys and Values of the tokens "Once upon a".
+ * This involves a forward pass that processes all the tokens at once by processing
+ * all the 12 layers for the given T tokens and remembering the per-layer KV cache.
+ * The size of the KV Cache is 2 * L * T tensors each of size 1 X C.
+ *
+ * The decoder prefill step is needed only once per processing of the input tokens */
+void Decoder::prefill(vector<int32_t> tokens) {
+    Tensor x = embed(tokens);        // embedding + postitional encoding
+    assert(x.cols() == embedsize_);  // shape of x (T, C)
+    assert(x.rows() <= maxT_);       // make sure # of tokens <= max context window
+
+    for (int i = 0; i < nlayers_; i++) {
+        x = layers_[i].forward(x);
+    }
+}
+
+/* The decode step relies on the previously computed KV cache and uses it to
+ * decode the current token that is generated.
+ *
+ * The query vector for the token is produced. In the example, that would be "time" and
+ * the KV Cache's Key and Value tensors are used to produce a (T + 1) x C matrices for
+ * K and V.
+ *
+ * Then, the QK.softmax() * V produces a 1 x C tensor which is used for predicting the
+ * next token.
+ *
+ * The generated K, V values for the current query token is appended into the KV cache. */
+Tensor Decoder::decode(
+    int32_t token, int32_t position,
+    const std::function<void(const int index, const Tensor&)>& checkActivations) {
+    // embedding + postitional encoding
+    return run(embed_one(token, position), true, checkActivations);
+}
+
+void Decoder::forget_all_tokens() {
+    int num_tokens = kv_cache_.get_num_tokens(0);
+
+    for (int i = 0; i < num_tokens; i++) {
+        kv_cache_.remove_oldest_token();
+    }
 }

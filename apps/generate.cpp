@@ -1,4 +1,5 @@
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -55,9 +56,11 @@ void printHelp(char* programName) {
     cout << "       This program cannot read the HuggingFace safetensors format.\n";
 }
 
-void parseArgs(unordered_map<string, variant<int, string, float>>& args, int argc, char** argv) {
+void parseArgs(unordered_map<string, variant<bool, int, string, float>>& args, int argc,
+               char** argv) {
     // meaningful defaults
     args["temperature"] = 0.75f;
+    args["use_kv_cache"] = false;
 
     vector<string> positional;
     for (int i = 1; i < argc; i++) {
@@ -79,6 +82,10 @@ void parseArgs(unordered_map<string, variant<int, string, float>>& args, int arg
             }
             if (temperature < 0.0f) temperature = 0.75f;
             args["temperature"] = temperature;
+            continue;
+        }
+        if (arg == "-kv") {
+            args["use_kv_cache"] = true;
             continue;
         }
         if (!arg.empty() && arg[0] == '-') {
@@ -107,7 +114,7 @@ void parseArgs(unordered_map<string, variant<int, string, float>>& args, int arg
 
 int main(int argc, char** argv) {
     // parse command line
-    unordered_map<string, variant<int, string, float>> args;
+    unordered_map<string, variant<bool, int, string, float>> args;
     parseArgs(args, argc, argv);
     cout << "Weights file:          " << get<string>(args["weights_file"]) << "\n";
     cout << "Tokenizer file:        " << get<string>(args["tokenizer_file"]) << "\n";
@@ -122,6 +129,7 @@ int main(int argc, char** argv) {
 
     // "Once upon a time, there was a"
     vector<int32_t> tokens = {7454, 2402, 257, 640, 11, 612, 373, 257};
+    int token_pos;
     vector<int32_t> output;
 
     Checkpoint ckpt(get<string>(args["weights_file"]).c_str());
@@ -132,21 +140,36 @@ int main(int argc, char** argv) {
     cout << "Attention heads:        " << ckpt.nh << "\n";
     cout << "Embedding dimensions:   " << ckpt.embsz << "\n";
     cout << "Padded vocabulary size: " << ckpt.vocab_padded << "\n";
-    // instantiate the decoder from the checkpoint
-    Decoder gpt2(ckpt);
 
     // Autoregressive loop
     int32_t pred = tokens[0];
     int tokens_generated = 0;
     int numtokens = get<int>(args["num_tokens"]);
     float temp = get<float>(args["temperature"]);
+    bool use_kv_cache = get<bool>(args["use_kv_cache"]);
     constexpr int TOPK = 40;
     constexpr unsigned int SEED = 42;
     std::mt19937 gen(SEED);  // random number generator
     std::uniform_real_distribution<float> dis(0.0f, 1.0f);
 
+    // instantiate the decoder from the checkpoint
+    Decoder gpt2(ckpt, use_kv_cache);
+    Tensor logits;
+    auto start_time = std::chrono::steady_clock::now();
+
+    if (use_kv_cache) {
+        vector<int32_t> prefill_tokens = vector<int32_t>(tokens.begin(), tokens.end() - 1);
+        gpt2.prefill(prefill_tokens);
+    }
+
+    token_pos = tokens.size() - 1;
     while (true) {
-        Tensor logits = gpt2.forward(tokens, nullptr);  // shape (T, C)
+        if (use_kv_cache) {
+            logits = gpt2.decode(tokens[tokens.size() - 1], token_pos, nullptr);  // shape (1, V)
+        } else {
+            logits = gpt2.forward(tokens, nullptr);  // shape (1, V)
+        }
+
         if (temp == 0.0f) {
             // greedy decoding
             pred = logits.argmax(0);
@@ -194,13 +217,30 @@ int main(int argc, char** argv) {
             assert(pred < vocab);
             cout << idToToken(pred, tk, OFFSET_TOKENS) << std::flush;  // Decode tokenid -> token
             tokens.push_back(pred);
+            token_pos++;
             // check number of elements in tokens
             // keep a sliding window of maxT tokens at maximum
             if (tokens.size() > static_cast<size_t>(ckpt.maxT)) {
                 tokens.erase(tokens.begin());  // remove front element
+
+                if (use_kv_cache) {
+                    gpt2.forget_all_tokens();
+
+                    vector<int32_t> prefill_tokens =
+                        vector<int32_t>(tokens.begin(), tokens.end() - 1);
+                    gpt2.prefill(prefill_tokens);
+                    token_pos = tokens.size() - 1;
+                }
             }
         } else {
             break;
         }
     }
+
+    auto end_time = std::chrono::steady_clock::now();
+
+    cout << endl
+         << "Total Elapsed time: "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time)
+         << " milliseconds\n";
 }

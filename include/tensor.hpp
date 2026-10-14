@@ -80,6 +80,8 @@ class Tensor {
     // flatten a Tensor to a vector<float>
     std::vector<float> flatten() const;
 
+    Tensor slice(int row_start, int row_end, int col_start, int col_end);
+
     // Tensor ops
     Tensor transpose() const;
     Tensor matmul(const Tensor&) const;
