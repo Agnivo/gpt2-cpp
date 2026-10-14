@@ -24,7 +24,7 @@ class LayerKVCache {
     int layer_idx_;
     int num_embed_dims_;
 
-    /* The key-value caches for each layer. Layers X Tokens X Dims */
+    /* The key-value caches for each layer. Tokens x Embed Dimensions */
     std::vector<Tensor> key_cache_;
     std::vector<Tensor> value_cache_;
 };
@@ -51,7 +51,7 @@ class KVCache {
     int num_layers_;
     int num_embed_dims_;
 
-    /* The key-value caches for each layer. Layers X Tokens X Dims */
+    /* The key-value caches for all layers. Layers x Tokens x Embed Dimensions */
     std::vector<LayerKVCache> kv_cache_;
 };
 

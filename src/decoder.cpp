@@ -25,28 +25,21 @@ inline void gelu_(Tensor& x) {
 
 // input shape (T, C), output shape (T, C)
 // See https://arxiv.org/pdf/2002.04745 Figure 1b.
-Tensor Layer::forward(const Tensor& x) {
-    Tensor out(x.rows(), x.cols());
-    Tensor h(x.rows(), x.cols());
-    Tensor h1(x.rows(), x.cols());
-    out = ln1_.forward(x);
-    out = attn_.forward(out);
-    h = out + x;  // add the residual stream
-    h1 = ln2_.forward(h);
+// kv_cache == nullptr runs full attention over all T rows. Otherwise x is the single new
+// token's row, and attention reads from and appends to the cache.
+Tensor Layer::run(const Tensor& x, KVCache* kv_cache, int layer_index) {
+    Tensor out = ln1_.forward(x);
+    out = kv_cache ? attn_.decode(*kv_cache, layer_index, out) : attn_.forward(out);
+    Tensor h = out + x;  // add the residual stream
+    Tensor h1 = ln2_.forward(h);
     h1 = ffn_.forward(h1);
     return h + h1;  // add the residual stream
 }
 
+Tensor Layer::forward(const Tensor& x) { return run(x, nullptr, 0); }
+
 Tensor Layer::decode(KVCache& kv_cache, int layer_index, const Tensor& x) {
-    Tensor out(x.rows(), x.cols());
-    Tensor h(x.rows(), x.cols());
-    Tensor h1(x.rows(), x.cols());
-    out = ln1_.forward(x);
-    out = attn_.decode(kv_cache, layer_index, out);
-    h = out + x;  // add the residual stream
-    h1 = ln2_.forward(h);
-    h1 = ffn_.forward(h1);
-    return h + h1;  // add the residual stream
+    return run(x, &kv_cache, layer_index);
 }
 
 // Linear (input, hidden), GELU, Linear (hidden, output)
@@ -361,13 +354,11 @@ Tensor Decoder::embed_one(const int32_t token, const int32_t position) {
     return x;
 }
 
-// The input into the decoder is of shape (T, C), and output are logits of shape (1, V)
-// the predicted token
-Tensor Decoder::forward(
-    vector<int32_t> tokens,
-    const std::function<void(const int index, const Tensor&)>& checkActivations) {
+// x is the embedded input: shape (T, C) when cached is false,
+// and (1, C) holding just the new token when cached is true. Output are logits of shape (1, V).
+Tensor Decoder::run(Tensor x, bool cached,
+                    const std::function<void(const int index, const Tensor&)>& checkActivations) {
     int tensorindex = 0;
-    Tensor x = embed(tokens);        // embedding + postitional encoding
     assert(x.cols() == embedsize_);  // shape of x (T, C)
     assert(x.rows() <= maxT_);       // make sure # of tokens <= max context window
     if (checkActivations) {
@@ -376,7 +367,7 @@ Tensor Decoder::forward(
 
     // Run through all the layers
     for (int i = 0; i < nlayers_; i++) {
-        x = layers_[i].forward(x);
+        x = cached ? layers_[i].decode(kv_cache_, i, x) : layers_[i].forward(x);
         if (checkActivations) {
             checkActivations(tensorindex++, x);
         }
@@ -411,6 +402,13 @@ Tensor Decoder::forward(
     return final_logits;
 }
 
+// The input into the decoder is of shape (T, C), and output are logits of shape (1, V)
+Tensor Decoder::forward(
+    vector<int32_t> tokens,
+    const std::function<void(const int index, const Tensor&)>& checkActivations) {
+    return run(embed(tokens), false, checkActivations);  // embedding + postitional encoding
+}
+
 /* Generate the KV cache for all the input prompt tokens by running through a forward pass
  * of the Decoder.
  *
@@ -435,55 +433,18 @@ void Decoder::prefill(vector<int32_t> tokens) {
  * decode the current token that is generated.
  *
  * The query vector for the token is produced. In the example, that would be "time" and
- * the KV Cache's Key and Value tensors are used to produce a (T + 1) X C matrices for
+ * the KV Cache's Key and Value tensors are used to produce a (T + 1) x C matrices for
  * K and V.
  *
- * Then, the QK.softmax() * V produces a 1 X C tensor which is used for predicting the
+ * Then, the QK.softmax() * V produces a 1 x C tensor which is used for predicting the
  * next token.
  *
  * The generated K, V values for the current query token is appended into the KV cache. */
 Tensor Decoder::decode(
     int32_t token, int32_t position,
     const std::function<void(const int index, const Tensor&)>& checkActivations) {
-    int tensorindex = 0;
-
-    Tensor x = embed_one(token, position);  // embedding + postitional encoding
-    assert(x.cols() == embedsize_);         // shape of x (T, C)
-    assert(x.rows() <= maxT_);              // make sure # of tokens <= max context window
-    if (checkActivations) {
-        checkActivations(tensorindex++, x);
-    }
-
-    // Run through all the layers
-    for (int i = 0; i < nlayers_; i++) {
-        x = layers_[i].decode(kv_cache_, i, x);
-        if (checkActivations) {
-            checkActivations(tensorindex++, x);
-        }
-    }
-
-    Tensor logits = Tensor(1, embedsize_);
-    // Final layerNorm, shape (1, C)
-    logits = finalLN_.forward(x);
-    assert(logits.rows() == 1 && logits.cols() == embedsize_);
-    if (checkActivations) {
-        checkActivations(tensorindex++, logits);
-    }
-
-    // Vocabulary projection, shape (1, Vp)
-    logits = vocabproj_.forward(logits);
-    assert(logits.rows() == 1 && logits.cols() == vocab_padded_);
-    if (checkActivations) {
-        checkActivations(tensorindex++, logits);
-    }
-
-    // Remove the padded entries, shape (1, V) after this
-    Tensor final_logits(1, vocab_);
-    for (int i = 0; i < vocab_; i++) {
-        final_logits.set(0, i, logits.at(0, i));
-    }
-    assert(final_logits.rows() == 1 && final_logits.cols() == vocab_);
-    return final_logits;
+    // embedding + postitional encoding
+    return run(embed_one(token, position), true, checkActivations);
 }
 
 void Decoder::forget_all_tokens() {

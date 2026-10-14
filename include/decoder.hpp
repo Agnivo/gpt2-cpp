@@ -105,6 +105,8 @@ class Layer {
     MHSA attn_;
     LayerNorm ln2_;
     FFN ffn_;
+
+    Tensor run(const Tensor& x, KVCache* kv_cache, int layer_index);
 };
 
 class Decoder {
@@ -135,6 +137,8 @@ class Decoder {
     bool use_kv_cache_;          // should the decoder use key value cache?
     KVCache kv_cache_;           // key-value cache
 
+    Tensor run(Tensor x, bool cached,
+               const std::function<void(const int index, const Tensor&)>& checkActivations);
     void loadFromCheckpoint(Checkpoint checkpoint);
     void loadLayerWeights(int i, std::span<const float> ln1w, std::span<const float> ln1b,
                           std::span<const float> qkvw, std::span<const float> qkvb,

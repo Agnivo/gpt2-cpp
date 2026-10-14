@@ -146,29 +146,37 @@ void checkActivations(const int index, const Tensor& t) {
     }
 }
 
-// TODO: This function has bugs - see the parseArgs in generate.cpp for the correct implementation.
+void printHelp(char* programName) {
+    cout << "Usage: " << programName;
+    cout << " [-h | --help] <weights_file> <sample_tokens_file>" << "\n";
+    cout << "Notes: See karpathy/llm.c to get the GPT2_124M.bin weights file.\n";
+    cout << "       This program cannot read the HuggingFace safetensors format.\n";
+}
+
 void parseArgs(unordered_map<string, variant<int, string>>& args, int argc, char** argv) {
-    // If fewer args than we are expecting, print out help
-    if (argc < 3) {
-        cout << "Usage: " << argv[0];
-        cout << " [-h | --help] <weights_file> <sample_tokens_file>" << "\n";
-        cout << "Notes: See karpathy/llm.c to get the GPT2_124M.bin weights file.\n";
-        cout << "       This program cannot read the HuggingFace safetensors format.\n";
-        exit(0);
-    }
-    // If any arg is -h or --help, print out help
+    vector<string> positional;
+
     for (int i = 1; i < argc; i++) {
-        string arg = argv[i];
+        std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
-            cout << "Usage: " << argv[0];
-            cout << " [-h | --help] <weights_file> <sample_tokens_file>" << "\n";
-            cout << "Notes: See karpathy/llm.c to get the GPT2_124M.bin weights file.\n";
-            cout << "       This program cannot read the HuggingFace safetensors format.\n";
+            printHelp(argv[0]);
             exit(0);
         }
+        if (!arg.empty() && arg[0] == '-') {
+            cerr << "error: unknown option '" << arg << "'\n";
+            printHelp(argv[0]);
+            exit(1);
+        }
+        positional.push_back(arg);
     }
-    args["weights_file"] = string(argv[1]);
-    args["sample_tokens_file"] = string(argv[2]);
+
+    // Mandatory positional args
+    if (positional.size() != 2) {
+        printHelp(argv[0]);
+        exit(positional.empty() ? 0 : 1);
+    }
+    args["weights_file"] = positional[0];
+    args["sample_tokens_file"] = positional[1];
 }
 
 // Usage: testactivations [-h | --help] <weights_file> <sample_tokens_file>

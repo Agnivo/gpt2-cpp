@@ -1,4 +1,5 @@
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -7,7 +8,6 @@
 #include <unordered_map>
 #include <variant>
 #include <vector>
-#include <chrono>
 
 #include "checkpoint.hpp"
 #include "decoder.hpp"
@@ -56,9 +56,11 @@ void printHelp(char* programName) {
     cout << "       This program cannot read the HuggingFace safetensors format.\n";
 }
 
-void parseArgs(unordered_map<string, variant<bool, int, string, float>>& args, int argc, char** argv) {
+void parseArgs(unordered_map<string, variant<bool, int, string, float>>& args, int argc,
+               char** argv) {
     // meaningful defaults
     args["temperature"] = 0.75f;
+    args["use_kv_cache"] = false;
 
     vector<string> positional;
     for (int i = 1; i < argc; i++) {
@@ -113,7 +115,6 @@ void parseArgs(unordered_map<string, variant<bool, int, string, float>>& args, i
 int main(int argc, char** argv) {
     // parse command line
     unordered_map<string, variant<bool, int, string, float>> args;
-    args["use_kv_cache"] = false;
     parseArgs(args, argc, argv);
     cout << "Weights file:          " << get<string>(args["weights_file"]) << "\n";
     cout << "Tokenizer file:        " << get<string>(args["tokenizer_file"]) << "\n";
@@ -156,23 +157,19 @@ int main(int argc, char** argv) {
     Tensor logits;
     auto start_time = std::chrono::steady_clock::now();
 
-    if (use_kv_cache)
-    {
+    if (use_kv_cache) {
         vector<int32_t> prefill_tokens = vector<int32_t>(tokens.begin(), tokens.end() - 1);
         gpt2.prefill(prefill_tokens);
     }
 
     token_pos = tokens.size() - 1;
     while (true) {
-        if (use_kv_cache)
-        {
-            logits = gpt2.decode(tokens[tokens.size()-1], token_pos, nullptr);  // shape (1, V)
-        }
-        else
-        {
+        if (use_kv_cache) {
+            logits = gpt2.decode(tokens[tokens.size() - 1], token_pos, nullptr);  // shape (1, V)
+        } else {
             logits = gpt2.forward(tokens, nullptr);  // shape (1, V)
         }
-        
+
         if (temp == 0.0f) {
             // greedy decoding
             pred = logits.argmax(0);
@@ -226,11 +223,11 @@ int main(int argc, char** argv) {
             if (tokens.size() > static_cast<size_t>(ckpt.maxT)) {
                 tokens.erase(tokens.begin());  // remove front element
 
-                if (use_kv_cache)
-                {
+                if (use_kv_cache) {
                     gpt2.forget_all_tokens();
 
-                    vector<int32_t> prefill_tokens = vector<int32_t>(tokens.begin(), tokens.end() - 1);
+                    vector<int32_t> prefill_tokens =
+                        vector<int32_t>(tokens.begin(), tokens.end() - 1);
                     gpt2.prefill(prefill_tokens);
                     token_pos = tokens.size() - 1;
                 }
@@ -242,5 +239,8 @@ int main(int argc, char** argv) {
 
     auto end_time = std::chrono::steady_clock::now();
 
-    cout << endl << "Total Elapsed time: " <<  std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time) << " milliseconds\n";
+    cout << endl
+         << "Total Elapsed time: "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time)
+         << " milliseconds\n";
 }
